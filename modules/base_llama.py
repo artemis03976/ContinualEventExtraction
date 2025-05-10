@@ -7,7 +7,7 @@ from typing import Union, Optional, Tuple, List
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import (
-    LlamaAttention, LlamaDecoderLayer, LlamaModel, apply_rotary_pos_emb, LlamaForCausalLM, LlamaSdpaAttention
+    LlamaAttention, LlamaDecoderLayer, LlamaModel, apply_rotary_pos_emb, LlamaForCausalLM, LlamaSdpaAttention, repeat_kv
 )
 from transformers.utils import is_flash_attn_greater_or_equal_2_10
 from transformers.modeling_flash_attention_utils import _flash_attention_forward
@@ -46,20 +46,24 @@ class LlamaAttentionWithLora(LlamaAttention):
             )
         )
 
-    def get_merged_lora_states(self, hidden_states, lora_attn_weights, target='q'):
-        bsz, _, _ = lora_attn_weights.size()
+    def get_merged_lora_states(self, hidden_states, lora_attn_weights, target='q', n_module_to_use=None):
+        bsz, n_task, _ = lora_attn_weights.size()
+        if n_module_to_use is None:
+            n_module_to_use = n_task
+        
+        lora_attn_weights = lora_attn_weights[:, :n_module_to_use]
 
         if target == 'q':
-            lora_states = torch.cat([lora(hidden_states).unsqueeze(0) for lora in self.lora_q_weights], dim=0)
+            lora_states = torch.cat([lora(hidden_states).unsqueeze(0) for lora in self.lora_q_weights[:n_module_to_use]], dim=0)
             lora_states = lora_states.transpose(0, 1).reshape(bsz, -1, hidden_states.shape[1] * self.num_heads * self.head_dim)
             merged_lora_states = torch.matmul(lora_attn_weights.transpose(1, 2), lora_states).squeeze()
             merged_lora_states = merged_lora_states.reshape(bsz, -1, self.num_heads * self.head_dim)
         elif target == 'v':
-            lora_states = torch.cat([lora(hidden_states).unsqueeze(0) for lora in self.lora_v_weights], dim=0)
+            lora_states = torch.cat([lora(hidden_states).unsqueeze(0) for lora in self.lora_v_weights[:n_module_to_use]], dim=0)
             lora_states = lora_states.transpose(0, 1).reshape(bsz, -1, hidden_states.shape[1] * self.num_key_value_heads * self.head_dim)
             merged_lora_states = torch.matmul(lora_attn_weights.transpose(1, 2), lora_states).squeeze()
             merged_lora_states = merged_lora_states.reshape(bsz, -1, self.num_key_value_heads * self.head_dim)
- 
+
         return merged_lora_states
 
     def forward(
@@ -75,12 +79,13 @@ class LlamaAttentionWithLora(LlamaAttention):
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
-
+ 
         # ====================================================================================
         lora_attn_weights = kwargs.get('lora_attn_weights', None)
+        n_module_to_use = kwargs.get('n_module_to_use', None)
 
-        lora_q_states = self.get_merged_lora_states(hidden_states, lora_attn_weights, target='q')
-        lora_v_states = self.get_merged_lora_states(hidden_states, lora_attn_weights, target='v')
+        lora_q_states = self.get_merged_lora_states(hidden_states, lora_attn_weights, target='q', n_module_to_use=n_module_to_use)
+        lora_v_states = self.get_merged_lora_states(hidden_states, lora_attn_weights, target='v', n_module_to_use=n_module_to_use)
 
         query_states = self.q_proj(hidden_states) + lora_q_states
         key_states = self.k_proj(hidden_states)
@@ -101,6 +106,9 @@ class LlamaAttentionWithLora(LlamaAttention):
              # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
 
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
@@ -160,9 +168,10 @@ class LlamaFlashAttention2WithLora(LlamaAttentionWithLora):
 
         # ====================================================================================
         lora_attn_weights = kwargs.get('lora_attn_weights', None)
+        n_module_to_use = kwargs.get('n_module_to_use', None)
 
-        lora_q_states = self.get_merged_lora_states(hidden_states, lora_attn_weights, target='q')
-        lora_v_states = self.get_merged_lora_states(hidden_states, lora_attn_weights, target='v')
+        lora_q_states = self.get_merged_lora_states(hidden_states, lora_attn_weights, target='q', n_module_to_use=n_module_to_use)
+        lora_v_states = self.get_merged_lora_states(hidden_states, lora_attn_weights, target='v', n_module_to_use=n_module_to_use)
 
         query_states = self.q_proj(hidden_states) + lora_q_states
         key_states = self.k_proj(hidden_states)
@@ -264,6 +273,7 @@ class LlamaModelWithLora(LlamaModel):
         self,
         input_ids: torch.LongTensor = None,
         lora_attn_weights: torch.LongTensor = None,
+        n_module_to_use: int = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
@@ -348,6 +358,7 @@ class LlamaModelWithLora(LlamaModel):
                     position_embeddings=position_embeddings,
                     # =================================
                     lora_attn_weights=lora_attn_weights,
+                    n_module_to_use=n_module_to_use,
                     # =================================
                 )
 
@@ -389,6 +400,7 @@ class LlamaForCausalLMWithLora(LlamaForCausalLM):
         self,
         input_ids: torch.LongTensor = None,
         lora_attn_weights: torch.LongTensor = None,
+        n_module_to_use: int = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
@@ -410,6 +422,7 @@ class LlamaForCausalLMWithLora(LlamaForCausalLM):
         outputs = self.model(
             input_ids=input_ids,
             lora_attn_weights=lora_attn_weights,
+            n_module_to_use=n_module_to_use,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,

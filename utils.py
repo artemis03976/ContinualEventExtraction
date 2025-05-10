@@ -1,10 +1,12 @@
 import random
 import numpy as np
 import torch
+import torch.nn as nn
 import os
 from datetime import datetime
 import logging
 from torch.nn.parallel import DistributedDataParallel
+import json
 
 
 def set_seeds(seed):
@@ -41,8 +43,82 @@ def get_logger(args):
 
     return logger
 
+
 def distribution_state_manager(model):
     if isinstance(model, DistributedDataParallel):
         return model.module
     else:
         return model
+
+
+def compute_sample_losses(logits, labels):
+
+    # Shift so that tokens < n predict n
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+    # Flatten the tokens
+    loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+    losses = []
+
+    for i in range(logits.shape[0]):
+        # Enable model parallelism
+        shift_labels = shift_labels.to(shift_logits.device)
+        losses.append(loss_fct(shift_logits[i], shift_labels[i])) 
+    
+    return losses
+
+
+def get_grad_norm(attn_grad):
+    # attn_grad: (batch_size, num_heads, seq_len, seq_len)
+    # 先按 batch 维度求平均，然后对每个 head 计算 L2 范数
+    grad_mean = attn_grad.mean(dim=0)  # (num_heads, seq_len, seq_len)
+    # 展开最后两个维度，计算每个 head 的 L2 范数
+    num_heads = grad_mean.size(0)
+    l2_norms = grad_mean.view(num_heads, -1).norm(p=2, dim=1)  # (num_heads,)
+    return l2_norms
+
+
+def clean_text(text):
+    marker = "Results:"
+    start_idx = text.find(marker)
+    if start_idx != -1:
+        text = text[start_idx + len(marker):].strip()
+
+    marker = "`\n</think>"
+    start_idx = text.find(marker)
+    if start_idx != -1:
+        text = text[:start_idx].strip()
+
+    return text
+
+
+def compare_json(json1, json2):
+    try:
+        obj1 = json.loads(json1)
+        obj2 = json.loads(json2)
+        return 1 if obj1 == obj2 else 0
+    except json.JSONDecodeError:
+        print("Invalid json format!")
+        return -1
+    
+def compute_event_f1(predictions, ground_truths):
+    TP, FP, FN = 0, 0, 0
+
+    for pred_events, gold_events in zip(predictions, ground_truths):
+        # Convert to set of tuples
+        pred_set = set((e['event_type'], e['trigger']) for e in pred_events)
+        gold_set = set((e['event_type'], e['trigger']) for e in gold_events)
+
+        TP += len(pred_set & gold_set)
+        FP += len(pred_set - gold_set)
+        FN += len(gold_set - pred_set)
+
+    precision = TP / (TP + FP) if TP + FP else 0.0
+    recall = TP / (TP + FN) if TP + FN else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+
+    return {
+        "precision": precision,
+        "recall": recall,
+        "f1": f1
+    }

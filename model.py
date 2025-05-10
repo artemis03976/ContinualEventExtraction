@@ -2,10 +2,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from modules.base_llama import LlamaForCausalLMWithLora
+from modules.base_qwen import Qwen2ForCausalLMWithLora
 from transformers import AutoTokenizer
 import math
-
 from modules.lora import LoRAConfig
+from utils import clean_text
 
 
 class ContinualEventExtractionModel(nn.Module):
@@ -21,14 +22,24 @@ class ContinualEventExtractionModel(nn.Module):
 
         self.lora_config = LoRAConfig(lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout)
 
-        # base model with incremental lora
-        self.base_model = LlamaForCausalLMWithLora.from_pretrained(
-            base_model_name,
-            self.lora_config,
-            torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
-        )
+        # Base model with incremental lora
+        if 'Llama' in base_model_name:
+            self.base_model = LlamaForCausalLMWithLora.from_pretrained(
+                base_model_name,
+                self.lora_config,
+                attn_implementation='eager',  # To obtain attention weights
+                torch_dtype=torch.bfloat16,
+            )
+        elif 'Qwen' in base_model_name:
+            self.base_model = Qwen2ForCausalLMWithLora.from_pretrained(
+                base_model_name,
+                self.lora_config,
+                attn_implementation='eager',  # To obtain attention weights
+                torch_dtype=torch.bfloat16,
+            )
         self.tokenizer = AutoTokenizer.from_pretrained(base_model_name)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
 
         for param in self.base_model.parameters():
             param.requires_grad = False
@@ -39,17 +50,13 @@ class ContinualEventExtractionModel(nn.Module):
         self.frozen_lora_keys = nn.ParameterList()
         self.trainable_lora_key = nn.Parameter(torch.empty(0, self.model_dim))
 
-        # input transform to lora attn query
+        # Input transform to lora attn query
         self.lora_query = nn.Sequential(
             nn.Linear(self.model_dim, lora_query_hidden_dim, bias=False),
             nn.Linear(lora_query_hidden_dim, self.model_dim, bias=False),
             nn.SiLU(),
             nn.LayerNorm(self.model_dim)
         )
-
-        # 添加注意力缓存
-        self.hist_attn_cache = []  # 存储历史任务的注意力原型
-        self.current_attn_proto = None  # 当前任务注意力原型
     
     def add_new_lora_key(self):
         # Freeze all the previous lora keys
@@ -71,19 +78,11 @@ class ContinualEventExtractionModel(nn.Module):
         print("==== New lora key initialize done ====")
         self.add_new_lora_layer()
         print("==== New lora layer initialize done ====")
-        self.cache_attention_prototype()
-        self.current_attn_proto = None
-        print("==== Cache attention prototype done ===")
         # set device
         self.to(self.base_model.device)
         print("==== New task reset complete ====")
-    
-    def cache_attention_prototype(self):
-        if self.current_attn_proto is not None:
-            frozen_proto = self.current_attn_proto.detach().clone()
-            self.hist_attn_cache.append(frozen_proto)
 
-    def get_lora_attention(self, text_ids, record_proto=True):
+    def get_lora_attention(self, text_ids):
         input_embeds = self.base_model.get_input_embeddings()(text_ids)
 
         # max-pool operation
@@ -102,24 +101,16 @@ class ContinualEventExtractionModel(nn.Module):
         attn_scores = torch.bmm(lora_key, lora_query.transpose(1, 2)) / math.sqrt(self.model_dim)
         attn_weights = torch.softmax(attn_scores, dim=1)
 
-        # 新增记录原型逻辑
-        if record_proto and self.training:
-            # 使用指数移动平均更新原型
-            batch_proto = attn_weights.mean(dim=0)  # [n_keys, 1]
-
-            if self.current_attn_proto is not None:
-                if batch_proto.size(0) != self.current_attn_proto.size(0):
-                    # 当键数量变化时重置原型
-                    self.current_attn_proto = None
-
-            if self.current_attn_proto is None:
-                self.current_attn_proto = batch_proto
-            else:
-                self.current_attn_proto = 0.9 * self.current_attn_proto + 0.1 * batch_proto
-
         return attn_weights  
 
-    def forward(self, text_ids, input_ids, attention_mask, labels):
+    def forward(
+        self, 
+        text_ids=None, 
+        input_ids=None, 
+        attention_mask=None, 
+        labels=None, 
+        n_module_to_use=None
+    ):
         # get lora attention
         lora_attn_weights = self.get_lora_attention(text_ids)
 
@@ -128,44 +119,28 @@ class ContinualEventExtractionModel(nn.Module):
             input_ids=input_ids,
             labels=labels,
             attention_mask=attention_mask,
-            lora_attn_weights=lora_attn_weights
+            lora_attn_weights=lora_attn_weights,
+            output_attentions=True,
+            n_module_to_use=n_module_to_use
         )
 
-        # 计算KL正则项
-        kl_loss = self.compute_kl_penalty(lora_attn_weights)
+        return outputs
 
-        return outputs, kl_loss
-    
-    def compute_kl_penalty(self, current_attn):
-        """
-        计算新旧注意力分布的KL散度惩罚项
-        current_attn: 当前batch的注意力权重 [B, n_keys, 1]
-        """
-        kl_loss = 0.0
-        batch_size = current_attn.size(0)
-
-        for hist_attn in self.hist_attn_cache:
-            # 对齐维度：历史原型[n_keys,1] -> [1,n_keys,1]
-            hist = hist_attn.unsqueeze(0).to(current_attn.device)
-            hist_n_keys = hist.size(1)
-            current_n_keys = current_attn.size(1)
-
-            padding = torch.zeros(
-                (1, current_n_keys - hist_n_keys, 1),
-                device=current_attn.device
-            )
-            aligned_hist = torch.cat([hist, padding], dim=1)
+    def compute_distill_loss(self, head_importance, student_attns, teacher_attns):
+        loss = 0.0
+        for layer_idx, (s_attn, t_attn) in enumerate(zip(student_attns, teacher_attns)):
+            _, num_heads, seq_len, _ = s_attn.shape
+            # Get head importance of current layer
+            layer_weight = head_importance.get(f"layer_{layer_idx}", 1.0).view(1, num_heads, 1, 1)
             
-            # 计算分布相似性（反向KL散度更稳定）
-            kl_div = F.kl_div(
-                input=current_attn.log(), 
-                target=aligned_hist,
+            loss += F.kl_div(
+                torch.log(s_attn * layer_weight + 1e-8).view(-1, seq_len), 
+                t_attn.detach().view(-1, seq_len), 
                 reduction='batchmean',
-                log_target=False
+                log_target=False,
             )
-            kl_loss += kl_div
-            
-        return kl_loss / len(self.hist_attn_cache) if self.hist_attn_cache else 0.0
+                
+        return loss / len(student_attns)
         
     def save(self, path):
         lora_layer_name = ['lora_q_weights', 'lora_v_weights']
@@ -231,11 +206,17 @@ class ContinualEventExtractionModel(nn.Module):
          # get lora attention
         lora_attn_weights = self.get_lora_attention(text_ids)
 
-        return self.base_model.generate(
+        outputs = self.base_model.generate(
             inputs=input_ids,
             attention_mask=attention_mask,
             lora_attn_weights=lora_attn_weights,
+            max_new_tokens=256,
+            top_p=0.9,
+            pad_token_id=self.tokenizer.eos_token_id
         )
+        full_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+        return clean_text(full_text)
 
 
 if __name__ == "__main__":

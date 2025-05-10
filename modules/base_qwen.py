@@ -45,26 +45,32 @@ class Qwen2AttentionWithLora(Qwen2Attention):
             )
         )
 
-    def get_merged_lora_states(self, hidden_states, lora_attn_weights, target='q'):
-        bsz, _, _ = lora_attn_weights.size()
+    def get_merged_lora_states(self, hidden_states, lora_attn_weights, target='q', n_module_to_use=None):
+        bsz, n_task, _ = lora_attn_weights.size()
+        if n_module_to_use is None:
+            n_module_to_use = n_task
+        
+        lora_attn_weights = lora_attn_weights[:, :n_module_to_use]
 
         if target == 'q':
-            lora_states = torch.cat([lora(hidden_states).unsqueeze(0) for lora in self.lora_q_weights], dim=0)
+            lora_states = torch.cat([lora(hidden_states).unsqueeze(0) for lora in self.lora_q_weights[:n_module_to_use]], dim=0)
             lora_states = lora_states.transpose(0, 1).reshape(bsz, -1, hidden_states.shape[1] * self.num_heads * self.head_dim)
             merged_lora_states = torch.matmul(lora_attn_weights.transpose(1, 2), lora_states).squeeze()
             merged_lora_states = merged_lora_states.reshape(bsz, -1, self.num_heads * self.head_dim)
         elif target == 'v':
-            lora_states = torch.cat([lora(hidden_states).unsqueeze(0) for lora in self.lora_v_weights], dim=0)
+            lora_states = torch.cat([lora(hidden_states).unsqueeze(0) for lora in self.lora_v_weights[:n_module_to_use]], dim=0)
             lora_states = lora_states.transpose(0, 1).reshape(bsz, -1, hidden_states.shape[1] * self.num_key_value_heads * self.head_dim)
             merged_lora_states = torch.matmul(lora_attn_weights.transpose(1, 2), lora_states).squeeze()
             merged_lora_states = merged_lora_states.reshape(bsz, -1, self.num_key_value_heads * self.head_dim)
- 
+
         return merged_lora_states
+
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         lora_attn_weights: torch.Tensor,
+        n_module_to_use: Optional[int] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Cache] = None,
@@ -75,8 +81,8 @@ class Qwen2AttentionWithLora(Qwen2Attention):
         bsz, q_len, _ = hidden_states.size()
 
         # ====================================================================================
-        lora_q_states = self.get_merged_lora_states(hidden_states, lora_attn_weights, target='q')
-        lora_v_states = self.get_merged_lora_states(hidden_states, lora_attn_weights, target='v')
+        lora_q_states = self.get_merged_lora_states(hidden_states, lora_attn_weights, target='q', n_module_to_use=n_module_to_use)
+        lora_v_states = self.get_merged_lora_states(hidden_states, lora_attn_weights, target='v', n_module_to_use=n_module_to_use)
 
         query_states = self.q_proj(hidden_states) + lora_q_states
         key_states = self.k_proj(hidden_states)
@@ -313,6 +319,7 @@ class Qwen2DecoderLayerWithLora(Qwen2DecoderLayer):
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
             lora_attn_weights = kwargs.get('lora_attn_weights', None),
+            n_module_to_use=kwargs.get('n_module_to_use', None),
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
@@ -351,6 +358,7 @@ class Qwen2ModelWithLora(Qwen2Model):
         self,
         input_ids: torch.LongTensor = None,
         lora_attn_weights: torch.LongTensor = None,
+        n_module_to_use: Optional[int] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
@@ -431,6 +439,7 @@ class Qwen2ModelWithLora(Qwen2Model):
                     cache_position=cache_position,
                     # =================================
                     lora_attn_weights=lora_attn_weights,
+                    n_module_to_use=n_module_to_use,
                     # =================================
                 )
 
@@ -472,6 +481,7 @@ class Qwen2ForCausalLMWithLora(Qwen2ForCausalLM):
         self,
         input_ids: torch.LongTensor = None,
         lora_attn_weights: torch.LongTensor = None,
+        n_module_to_use: Optional[int] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
@@ -493,6 +503,7 @@ class Qwen2ForCausalLMWithLora(Qwen2ForCausalLM):
         outputs = self.model(
             input_ids=input_ids,
             lora_attn_weights=lora_attn_weights,
+            n_module_to_use=n_module_to_use,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,

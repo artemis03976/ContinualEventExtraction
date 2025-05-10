@@ -3,25 +3,38 @@ import torch.optim as optim
 import argparse
 import os
 import json
-from utils import set_seeds, get_logger, distribution_state_manager
+from utils import set_seeds, get_logger, distribution_state_manager, compute_sample_losses
 from data import get_dataloader, get_event_types, split_tasks_by_event_types
 from tqdm import tqdm
 from model import ContinualEventExtractionModel
 from accelerate import Accelerator
+from modules.buffer import HardSampleBuffer
+from modules.grad import AttnWeightGrad
 
 
-def train_single_task(args, model, train_dataloader, dev_dataloader, accelerator, logger, task_id):
+def train_single_task(args, model, train_dataloader, dev_dataloader, buffer, accelerator, logger, task_id):
     optimizer = optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr)
 
     model, optimizer, train_dataloader, dev_dataloader = accelerator.prepare(model, optimizer, train_dataloader, dev_dataloader)
+    model_interface = distribution_state_manager(model)
 
     total_loss_history = {
         'train_loss': [],
         'dev_loss': []
     }
 
-    model_interface = distribution_state_manager(model)
+    if task_id > 1:
+        hard_sample_loader = buffer.collect(
+            model_interface.base_model.device, 
+            args.batch_size
+        )
+        # Computing head_importance based on previous hard samples
+        analyzer = AttnWeightGrad(model)
+        head_importance = analyzer.compute_head_importance(hard_sample_loader)
+        analyzer.force_cleanup()
+        del analyzer
 
+    torch.cuda.empty_cache()
     accelerator.wait_for_everyone()
 
     for epoch in range(1, args.epochs + 1):
@@ -31,17 +44,51 @@ def train_single_task(args, model, train_dataloader, dev_dataloader, accelerator
 
         model.train()
         train_loss = 0.0
+
         for batch in tqdm(train_dataloader):
             with accelerator.accumulate(model):
-                text_ids, input_ids, attention_mask, labels = batch['text_ids'], batch['input_ids'], batch['attention_mask'], batch['labels']
-
-                outputs, kl_loss = model(text_ids, input_ids, attention_mask, labels)
-                total_loss = outputs.loss + args.kl_lambda * kl_loss
-    
                 optimizer.zero_grad()
-                accelerator.backward(total_loss)
+
+                # new task sample
+                outputs = model(**batch)
+                accelerator.backward(outputs.loss)
+
+                # Record current loss distribution
+                sample_losses = compute_sample_losses(outputs.logits, batch['labels'])
+                buffer.add(batch, sample_losses)
+
+                # Knowledge Distillation
+                distill_loss = 0.0
+                if task_id > 1 and args.use_distill:
+                    try:
+                        hard_samples = next(iter(hard_sample_loader))
+                    except StopIteration:
+                        # 重新初始化DataLoader
+                        hard_sample_loader = buffer.collect(
+                            device=model_interface.base_model.device,
+                            batch_size=args.batch_size
+                        )
+                        hard_samples = next(iter(hard_sample_loader))
+
+                    # Tearch model attention weights (Old task)
+                    with torch.no_grad():
+                        teacher_outputs = model(**hard_samples, n_module_to_use=task_id - 1)
+                    # Student model attention weights (New task)
+                    student_outputs = model(**hard_samples)
+
+                    # Calculate distillation loss on attention 
+                    attn_loss = model_interface.compute_distill_loss(
+                        head_importance,
+                        student_outputs.attentions,
+                        teacher_outputs.attentions
+                    )
+
+                    distill_loss = args.replay_lambda * student_outputs.loss + args.distill_lambda * attn_loss
+                    accelerator.backward(distill_loss)
+    
                 optimizer.step()
 
+                total_loss = outputs.loss + distill_loss
                 train_loss += total_loss.item()
 
         train_loss /= len(train_dataloader)
@@ -52,9 +99,7 @@ def train_single_task(args, model, train_dataloader, dev_dataloader, accelerator
             model.eval()
             dev_loss = 0.0
             for batch in tqdm(dev_dataloader):
-                text_ids, input_ids, attention_mask, labels = batch['text_ids'], batch['input_ids'], batch['attention_mask'], batch['labels']
-            
-                outputs, _ = model(text_ids, input_ids, attention_mask, labels)
+                outputs = model(**batch)
                 dev_loss += outputs.loss.item()
 
         dev_loss /= len(dev_dataloader)
@@ -68,53 +113,63 @@ def train_single_task(args, model, train_dataloader, dev_dataloader, accelerator
             logger.info(f"==== Best Dev Loss: {best_loss} at Epoch {best_loss_epoch} ====")
 
         # save best epoch
-        if accelerator.is_main_process and epoch == best_loss_epoch:
-            ckpt_path = os.path.join(args.output_path, "ckpt_best_loss.pth")
-            model_interface.save(ckpt_path)
-            logger.info(f"==== Save best loss ckpt to {ckpt_path} ====")
+        if epoch == best_loss_epoch:
+            # Update hard sample buffer based on current loss distribution
+            buffer.update(task_id, accelerator)
+            accelerator.print(f"==== Select {len(buffer.buffer.get(task_id, []))} hard samples ====")
 
-        # save reward and loss history
-        history = {
-            "total_loss_history": total_loss_history,
-        }
-        if accelerator.is_main_process and args.log_path is not None:
-            history_file = os.path.join(args.log_path, "history.json")
-            with open(history_file, 'w') as f:
-                json.dump(history, f, indent=4, separators=(',', ': '))
+            if accelerator.is_main_process:
+                ckpt_path = os.path.join(args.output_path, f"ckpt_best_loss_task_{task_id}.pth")
+                model_interface.save(ckpt_path)
+                logger.info(f"==== Save best loss ckpt to {ckpt_path} ====")
         
         accelerator.wait_for_everyone()
 
     # save in the end
     if accelerator.is_main_process:
-        ckpt_path = os.path.join(args.output_path, "ckpt_final.pth")
+        ckpt_path = os.path.join(args.output_path, f"ckpt_final_task_{task_id}.pth")
         model_interface.save(ckpt_path)
         logger.info(f"==== Save final ckpt to {ckpt_path} ====")
     
     accelerator.wait_for_everyone()
+
+    return buffer
 
 
 def train(args, model, accelerator, logger):
     # Get all event types
     event_types = get_event_types(args)
     event_type_groups = split_tasks_by_event_types(event_types=event_types, n_tasks=args.n_tasks, strategy=args.strategy)
-    
+    if accelerator.is_main_process:
+        with open(os.path.join(args.output_path, 'event_type_groups.json'), 'w') as f:
+            json.dump(event_type_groups, f, indent=4)
+
     train_dataloaders = get_dataloader(args, event_type_groups, tokenizer=model.tokenizer, phase='trigger', split='train')
     dev_dataloaders = get_dataloader(args, event_type_groups, tokenizer=model.tokenizer, phase='trigger', split='dev')
+
+    # Hard sample replay buffer
+    buffer = HardSampleBuffer(
+        tokenizer=model.tokenizer,
+        max_buffer_size=args.max_buffer_size // torch.cuda.device_count(),
+        ratio=args.ratio,
+    )
 
     for task_id, (train_dataloader, dev_dataloader) in enumerate(zip(train_dataloaders, dev_dataloaders)):
         if accelerator.is_main_process:
             logger.info(f"==== Training Task {task_id + 1} ====")
             logger.info(f"==== Initialize model for task {task_id + 1} ====")
 
-        # Load best checkpoint before training
+        # Load best checkpoint from last task before training the new one
         if task_id > 0:
-            previous_ckpt_path = os.path.join(args.output_path, f"ckpt_best_loss.pth")
+            previous_ckpt_path = os.path.join(args.output_path, f"ckpt_best_loss_task_{task_id}.pth")
             model.load(previous_ckpt_path)
             if accelerator.is_main_process:
                 logger.info(f"Loaded best checkpoint from task {task_id} at {previous_ckpt_path}")
 
         model.reset_for_new_task()
-        train_single_task(args, model, train_dataloader, dev_dataloader, accelerator, logger, task_id + 1)
+        buffer = train_single_task(args, model, train_dataloader, dev_dataloader, buffer, accelerator, logger, task_id + 1)
+        
+        print(f"==== Select {len(buffer.buffer.get(task_id + 1, []))} hard samples for task {task_id + 1} ====")
 
         if accelerator.is_main_process:
             logger.info(f"==== Task {task_id + 1} Training Done ====")
@@ -131,11 +186,11 @@ def get_args():
         help='base model for generating answers'
     )
     parser.add_argument(
-        '--lora_query_hidden_dim', type=int, default=128, 
+        '--lora_query_hidden_dim', type=int, default=256, 
         help=''
     )
     parser.add_argument(
-        '--lora_r', type=int, default=8, 
+        '--lora_r', type=int, default=16, 
         help=''
     )
     parser.add_argument(
@@ -143,7 +198,7 @@ def get_args():
         help=''
     )
     parser.add_argument(
-        '--lora_dropout', type=float, default=0.1,
+        '--lora_dropout', type=float, default=0.05,
         help=''
     )
 
@@ -163,6 +218,21 @@ def get_args():
     parser.add_argument(
         '--strategy', type=str, default='sequential',
         help='stratrgy for spliting dataset '
+    )
+
+    # buffer settings
+    parser.add_argument(
+        '--max_buffer_size', type=int, default=100, 
+        help=''
+    )
+    parser.add_argument(
+        '--ratio', type=float, default=0.01, 
+        help=''
+    )
+    parser.add_argument(
+        '--mode', type=str, default='distribution',
+        choices=['topk', 'distribution'],
+        help=''
     )
 
     # training settings
@@ -187,12 +257,16 @@ def get_args():
         help='gradient accumulation steps during training'
     )
     parser.add_argument(
-        '--ewc_lambda', type=float, default=10000,
-        help='EWC正则化强度系数（建议范围：1000-10000）'
+        '--distill_lambda', type=float, default=1.0,
+        help='知识蒸馏损失的权重'
     )
     parser.add_argument(
-        '--kl_lambda', type=float, default=1.0,
-        help='KL正则项强度系数'
+        '--replay_lambda', type=float, default=0.8,
+        help='知识蒸馏损失的权重'
+    )
+    parser.add_argument(
+        '--use_distill', action='store_true', default=False,
+        help='是否启用知识蒸馏'
     )
 
     # save settings

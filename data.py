@@ -244,22 +244,22 @@ def collate_fn(batch, tokenizer):
     for item in batch:
         # 填充 text_ids
         padding = [tokenizer.pad_token_id] * (max_text_len - len(item["text_ids"]))
-        padded_seq = torch.cat([item["text_ids"], torch.tensor(padding, dtype=torch.long)])
+        padded_seq = torch.cat([item["text_ids"], torch.tensor(padding, dtype=torch.long, device=item["text_ids"].device)])
         padded_batch['text_ids'].append(padded_seq)
     
         # 填充 input_ids
         padding = [tokenizer.pad_token_id] * (max_input_len - len(item["input_ids"]))
-        padded_seq = torch.cat([item["input_ids"], torch.tensor(padding, dtype=torch.long)])
+        padded_seq = torch.cat([item["input_ids"], torch.tensor(padding, dtype=torch.long, device=item["input_ids"].device)])
         padded_batch['input_ids'].append(padded_seq)
     
         # 填充 attention_mask
         padding = [0] * (max_input_len - len(item["input_ids"]))
-        padded_seq = torch.cat([item["attention_mask"], torch.tensor(padding, dtype=torch.long)])
+        padded_seq = torch.cat([item["attention_mask"], torch.tensor(padding, dtype=torch.long, device=item["attention_mask"].device)])
         padded_batch['attention_mask'].append(padded_seq)
 
         # 填充 labels
         padding = [-100] * (max_input_len - len(item["labels"]))
-        padded_seq = torch.cat([item["labels"], torch.tensor(padding, dtype=torch.long)])
+        padded_seq = torch.cat([item["labels"], torch.tensor(padding, dtype=torch.long, device=item["labels"].device)])
         padded_batch['labels'].append(padded_seq)
 
     return {
@@ -275,7 +275,7 @@ def get_dataloader(args, event_type_groups, phase='trigger', split='train', toke
     seen_event_types = [] 
 
     if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token  # 若模型无 pad_token，用 eos_token 代替
+        tokenizer.pad_token = tokenizer.eos_token
 
     for task_id, event_type_per_task in enumerate(event_type_groups):
         if split == 'train':
@@ -287,7 +287,7 @@ def get_dataloader(args, event_type_groups, phase='trigger', split='train', toke
                     tokenizer=tokenizer,
                     event_types=event_type_per_task
                 )
-                print(f'==== {len(sub_task_dataset)} {split} samples in Task {task_id} ====')
+                print(f'==== {len(sub_task_dataset)} {split} samples in Task {task_id + 1} ====')
 
         elif split == 'dev':
             if args.dataset == 'maven':
@@ -299,7 +299,18 @@ def get_dataloader(args, event_type_groups, phase='trigger', split='train', toke
                     tokenizer=tokenizer,
                     event_types=seen_event_types
                 )
-                print(f'==== {len(sub_task_dataset)} {split} samples in Task {task_id} ====')
+                print(f'==== {len(sub_task_dataset)} {split} samples in Task {task_id + 1} ====')
+    
+        elif split == 'test':
+            if args.dataset == 'maven':
+                sub_task_dataset = MavenDataset(
+                    root=args.data_root,
+                    phase=phase,
+                    split='valid',
+                    tokenizer=tokenizer,
+                    event_types=event_type_per_task
+                )
+                print(f'==== {len(sub_task_dataset)} {split} samples in Task {task_id + 1} ====')
 
         dataloader = DataLoader(
             sub_task_dataset,
@@ -320,7 +331,7 @@ if __name__ == '__main__':
     print(len(dataset))
 
     if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token  # 若模型无 pad_token，用 eos_token 代替
+        tokenizer.pad_token = tokenizer.eos_token 
 
     dataloader = DataLoader(
         dataset,
