@@ -3,7 +3,7 @@ import torch.optim as optim
 import argparse
 import os
 import json
-from utils import set_seeds, get_logger, distribution_state_manager, compute_sample_losses
+from utils import set_seeds, get_logger, distribution_state_manager, compute_sample_losses, compare_json
 from data import get_dataloader, get_event_types, split_tasks_by_event_types
 from tqdm import tqdm
 from model import ContinualEventExtractionModel
@@ -20,7 +20,8 @@ def train_single_task(args, model, train_dataloader, dev_dataloader, buffer, acc
 
     total_loss_history = {
         'train_loss': [],
-        'dev_loss': []
+        'dev_loss': [],
+        'dev_acc': []
     }
 
     if task_id > 1:
@@ -102,15 +103,44 @@ def train_single_task(args, model, train_dataloader, dev_dataloader, buffer, acc
                 outputs = model(**batch)
                 dev_loss += outputs.loss.item()
 
+            acc = 0.0
+            n_samples = 0
+            for batch in tqdm(dev_dataloader):
+                text_ids, input_ids, attention_mask, labels = batch['text_ids'], batch['input_ids'], batch['attention_mask'], batch['labels']
+
+                # get input_ids without answer
+                mask_lens = (labels == -100).sum(dim=1)
+                input_ids_without_labels = input_ids[:, :mask_lens]
+                attention_mask = attention_mask[:, :mask_lens]
+
+                with accelerator.autocast():
+                    outputs = model.generate(text_ids, input_ids_without_labels, attention_mask)
+
+                labels = [sample[sample != -100.0] for sample in labels]
+                labels = model.tokenizer.batch_decode(labels, skip_special_tokens=True)
+
+                results = compare_json(outputs, labels)
+                for result in results:
+                    if result != -1:
+                        acc += result
+
+                n_samples += len(text_ids)
+
         dev_loss /= len(dev_dataloader)
+        acc /= n_samples
         total_loss_history['dev_loss'].append(dev_loss)
+        total_loss_history['dev_acc'].append(acc)
 
         best_loss = min(total_loss_history['dev_loss'])
+        best_acc = max(total_loss_history['dev_acc'])
         best_loss_epoch = total_loss_history['dev_loss'].index(best_loss) + 1
+        best_acc_epoch = total_loss_history['dev_acc'].index(best_acc) + 1
         if accelerator.is_main_process:
             logger.info(f"==== Total Train Loss for Epoch {epoch}: {train_loss} ====")
             logger.info(f"==== Total Dev Loss for Epoch {epoch}: {dev_loss} ====")
+            logger.info(f"==== Total Dev Acc for Epoch {epoch}: {acc} ====")
             logger.info(f"==== Best Dev Loss: {best_loss} at Epoch {best_loss_epoch} ====")
+            logger.info(f"==== Best Dev Acc: {best_acc} at Epoch {best_acc_epoch} ====")
 
         # save best epoch
         if epoch == best_loss_epoch:
@@ -182,15 +212,15 @@ def get_args():
 
     # base model settings
     parser.add_argument(
-        '--base_model_name', type=str, default='deepseek-ai/DeepSeek-R1-Distill-Llama-8B', 
+        '--base_model_name', type=str, default='Qwen/Qwen2.5-7B-Instruct', 
         help='base model for generating answers'
     )
     parser.add_argument(
-        '--lora_query_hidden_dim', type=int, default=256, 
+        '--lora_query_hidden_dim', type=int, default=128, 
         help=''
     )
     parser.add_argument(
-        '--lora_r', type=int, default=16, 
+        '--lora_r', type=int, default=8, 
         help=''
     )
     parser.add_argument(
@@ -222,7 +252,7 @@ def get_args():
 
     # buffer settings
     parser.add_argument(
-        '--max_buffer_size', type=int, default=100, 
+        '--max_buffer_size', type=int, default=64, 
         help=''
     )
     parser.add_argument(
@@ -241,7 +271,7 @@ def get_args():
         help='random seed'
     )
     parser.add_argument(
-        '--lr', type=float, default=0.00005,
+        '--lr', type=float, default=0.0001,
         help='Learning rate of network.'
     )
     parser.add_argument(

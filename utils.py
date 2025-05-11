@@ -78,28 +78,36 @@ def get_grad_norm(attn_grad):
     return l2_norms
 
 
-def clean_text(text):
-    marker = "Results:"
-    start_idx = text.find(marker)
-    if start_idx != -1:
-        text = text[start_idx + len(marker):].strip()
+def clean_text(texts):
+    cleaned_text = []
+    for text in texts:
+        marker = "Results:"
+        start_idx = text.find(marker)
+        if start_idx != -1:
+            text = text[start_idx + len(marker):].strip()
 
-    marker = "`\n</think>"
-    start_idx = text.find(marker)
-    if start_idx != -1:
-        text = text[:start_idx].strip()
+        marker = "`\n</think>"
+        start_idx = text.find(marker)
+        if start_idx != -1:
+            text = text[:start_idx].strip()
 
-    return text
+        cleaned_text.append(text)
+
+    return cleaned_text
 
 
-def compare_json(json1, json2):
-    try:
-        obj1 = json.loads(json1)
-        obj2 = json.loads(json2)
-        return 1 if obj1 == obj2 else 0
-    except json.JSONDecodeError:
-        print("Invalid json format!")
-        return -1
+def compare_json(outputs, labels):
+    results = []
+    for output, label in zip(outputs, labels):
+        try:
+            obj1 = json.loads(output)
+            obj2 = json.loads(label)
+            results.append(1 if obj1 == obj2 else 0) 
+        except json.JSONDecodeError:
+            print("Invalid json format!")
+            results.append(-1)
+
+    return results
     
 def compute_event_f1(predictions, ground_truths):
     TP, FP, FN = 0, 0, 0

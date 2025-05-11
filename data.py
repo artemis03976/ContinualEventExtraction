@@ -219,6 +219,12 @@ class MavenDataset(ContinualEventExtractionDataset):
                     all_events[sent_id].append(processed_event)
 
             for i, text in enumerate(texts):
+                if len(all_events[i]) == 0:
+                    all_events[i].append({
+                        'trigger_word': None,
+                        'event_type': None,
+                        'span': None
+                    })
                 trigger_data.append({
                     'input_text': text,
                     'target_output': json.dumps(all_events[i])
@@ -228,6 +234,82 @@ class MavenDataset(ContinualEventExtractionDataset):
         with open(cache_path, 'w', encoding='utf-8') as f:
             json.dump(trigger_data, f, ensure_ascii=False, indent=4)
 
+
+class EREDataset(ContinualEventExtractionDataset):
+    def __init__(self, root='./data/ERE', phase='trigger', split='train', tokenizer=None, event_types=None):
+        super().__init__(root, phase, split, tokenizer, event_types)
+
+    def construct_trigger_dataset(self, force_rebuild=False):
+        cache_path = os.path.join(self.root, f'{self.phase}_{self.split}.json')
+        if not force_rebuild and os.path.exists(cache_path):
+            with open(cache_path, 'r', encoding='utf-8') as f:
+                self.trigger_data = json.load(f)
+            return
+
+        trigger_data = []
+        for docs in self.raw_data:
+            # get event text
+            text = docs['text']
+
+            # get events and classify by sentence id
+            all_events = [] 
+            for event in docs['events']:
+                for mention in event['triggers']:
+                    # discard useless info
+                    processed_event = {
+                        'trigger_word': mention['trigger_word'],
+                        'event_type': event['type'],
+                        'span': mention['position']
+                    }
+
+                    all_events.append(processed_event)
+
+            trigger_data.append({
+                'input_text': text,
+                'target_output': json.dumps(all_events)
+            })
+        
+        self.trigger_data = trigger_data
+        with open(cache_path, 'w', encoding='utf-8') as f:
+            json.dump(trigger_data, f, ensure_ascii=False, indent=4)
+
+
+class ACEDataset(ContinualEventExtractionDataset):
+    def __init__(self, root='./data/ACE2005-en', phase='trigger', split='train', tokenizer=None, event_types=None):
+        super().__init__(root, phase, split, tokenizer, event_types)
+
+    def construct_trigger_dataset(self, force_rebuild=False):
+        cache_path = os.path.join(self.root, f'{self.phase}_{self.split}.json')
+        if not force_rebuild and os.path.exists(cache_path):
+            with open(cache_path, 'r', encoding='utf-8') as f:
+                self.trigger_data = json.load(f)
+            return
+
+        trigger_data = []
+        for docs in self.raw_data:
+            # get event text
+            text = docs['sentence']
+
+            # get events and classify by sentence id
+            all_events = [] 
+            for event in docs['events']:
+                # discard useless info
+                processed_event = {
+                    'trigger_word': event['trigger']['text'],
+                    'event_type': event['event_type'],
+                    'span': [event['trigger']['start'], event['trigger']['end']]
+                }
+
+                all_events.append(processed_event)
+
+            trigger_data.append({
+                'input_text': text,
+                'target_output': json.dumps(all_events)
+            })
+        
+        self.trigger_data = trigger_data
+        with open(cache_path, 'w', encoding='utf-8') as f:
+            json.dump(trigger_data, f, ensure_ascii=False, indent=4)
 
 def collate_fn(batch, tokenizer):
     # 计算各序列的最大长度
@@ -314,7 +396,7 @@ def get_dataloader(args, event_type_groups, phase='trigger', split='train', toke
 
         dataloader = DataLoader(
             sub_task_dataset,
-            batch_size=args.batch_size,
+            batch_size=(args.batch_size if split == 'train' else 1),
             shuffle=(split == 'train'),
             collate_fn=partial(collate_fn, tokenizer=tokenizer),
             num_workers=4
@@ -327,7 +409,7 @@ def get_dataloader(args, event_type_groups, phase='trigger', split='train', toke
 if __name__ == '__main__':
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct")
-    dataset = MavenDataset(tokenizer=tokenizer)
+    dataset = ACEDataset(tokenizer=tokenizer)
     print(len(dataset))
 
     if tokenizer.pad_token is None:

@@ -214,7 +214,8 @@ class ContinualEventExtractionModel(nn.Module):
             top_p=0.9,
             pad_token_id=self.tokenizer.eos_token_id
         )
-        full_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+        full_text = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
 
         return clean_text(full_text)
 
