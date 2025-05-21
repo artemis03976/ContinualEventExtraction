@@ -13,9 +13,7 @@ from modules.grad import AttnWeightGrad
 from visualize import visualize_head_importance
 
 
-def train_single_task(args, model, train_dataloader, dev_dataloaders, buffer, accelerator, logger, task_id):
-    optimizer = optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr)
-
+def train_single_task(args, model, optimizer, train_dataloader, dev_dataloaders, buffer, accelerator, logger, task_id):
     model, optimizer, train_dataloader = accelerator.prepare(model, optimizer, train_dataloader)
     model_interface = distribution_state_manager(model)
 
@@ -37,8 +35,6 @@ def train_single_task(args, model, train_dataloader, dev_dataloaders, buffer, ac
         head_importance = analyzer.compute_head_importance(hard_sample_loader)
         analyzer.force_cleanup()
         del analyzer
-
-        # visualize_head_importance(head_importance, task_id - 1)
 
     torch.cuda.empty_cache()
     accelerator.wait_for_everyone()
@@ -183,10 +179,12 @@ def train(args, model, accelerator, logger):
     else:
         buffer = None
 
+    model.reset_for_new_task()
+    optimizer = optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr)
+
     for task_id, train_dataloader in enumerate(train_dataloaders):
         if accelerator.is_main_process:
             logger.info(f"==== Training Task {task_id + 1} ====")
-            logger.info(f"==== Initialize model for task {task_id + 1} ====")
 
         # Load best checkpoint from last task before training the new one
         if task_id > 0:
@@ -195,8 +193,7 @@ def train(args, model, accelerator, logger):
             if accelerator.is_main_process:
                 logger.info(f"Loaded best checkpoint from task {task_id} at {previous_ckpt_path}")
 
-        model.reset_for_new_task()
-        buffer = train_single_task(args, model, train_dataloader, dev_dataloaders[:task_id + 1], buffer, accelerator, logger, task_id + 1)
+        buffer = train_single_task(args, model, optimizer, train_dataloader, dev_dataloaders[:task_id + 1], buffer, accelerator, logger, task_id + 1)
         
         if args.use_distill:
             print(f"==== Select {len(buffer.buffer.get(task_id + 1, []))} hard samples for task {task_id + 1} ====")

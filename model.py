@@ -17,10 +17,12 @@ class ContinualEventExtractionModel(nn.Module):
         lora_r=32,
         lora_alpha=1,
         lora_dropout=0.0,
+        disable_shared_attn=False,
     ):
         super().__init__()
 
         self.lora_config = LoRAConfig(lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout)
+        self.disable_shared_attn = disable_shared_attn
 
         # Base model with incremental lora
         if 'Llama' in base_model_name:
@@ -46,17 +48,24 @@ class ContinualEventExtractionModel(nn.Module):
 
         self.model_dim = self.base_model.config.hidden_size
         
-        # lora attn key
-        self.frozen_lora_keys = nn.ParameterList()
-        self.trainable_lora_key = nn.Parameter(torch.empty(0, self.model_dim))
+        if not disable_shared_attn:
+            # lora attn key
+            self.frozen_lora_keys = nn.ParameterList()
+            self.trainable_lora_key = nn.Parameter(torch.empty(0, self.model_dim))
 
-        # Input transform to lora attn query
-        self.lora_query = nn.Sequential(
-            nn.Linear(self.model_dim, lora_query_hidden_dim, bias=False),
-            nn.Linear(lora_query_hidden_dim, self.model_dim, bias=False),
-            nn.SiLU(),
-            nn.LayerNorm(self.model_dim)
-        )
+            # Input transform to lora attn query
+            self.lora_query = nn.Sequential(
+                nn.Linear(self.model_dim, lora_query_hidden_dim, bias=False),
+                nn.Linear(lora_query_hidden_dim, self.model_dim, bias=False),
+                nn.SiLU(),
+                nn.LayerNorm(self.model_dim)
+            )
+        else:
+            self.frozen_lora_keys = None
+            self.trainable_lora_key = None
+            self.lora_query = None
+
+        self.n_cur_tasks = 0
     
     def add_new_lora_key(self):
         # Freeze all the previous lora keys
@@ -74,12 +83,14 @@ class ContinualEventExtractionModel(nn.Module):
             layer.self_attn.add_new_lora()
 
     def reset_for_new_task(self):
-        self.add_new_lora_key()
-        print("==== New lora key initialize done ====")
+        if not self.disable_shared_attn:
+            self.add_new_lora_key()
+            print("==== New lora key initialize done ====")
         self.add_new_lora_layer()
         print("==== New lora layer initialize done ====")
         # set device
         self.to(self.base_model.device)
+        self.n_cur_tasks += 1
         print("==== New task reset complete ====")
 
     def get_lora_attention(self, text_ids):
@@ -112,7 +123,8 @@ class ContinualEventExtractionModel(nn.Module):
         n_module_to_use=None
     ):
         # get lora attention
-        lora_attn_weights = self.get_lora_attention(text_ids)
+        lora_attn_weights = self.get_lora_attention(text_ids) if not self.disable_shared_attn else None
+        # lora_attn_weights = torch.ones((len(text_ids), self.n_cur_tasks, 1), dtype=torch.bfloat16, device=text_ids.device)
 
         # forward pass
         outputs = self.base_model(
@@ -143,37 +155,36 @@ class ContinualEventExtractionModel(nn.Module):
         return loss / len(student_attns)
         
     def save(self, path):
+        combined_state_dict = {}
+
+        # 添加 base_model 的 LoRA 权重
         lora_layer_name = ['lora_q_weights', 'lora_v_weights']
         lora_state_dict = {
             k: v for k, v in self.base_model.state_dict().items()
             if any(keyword in k for keyword in lora_layer_name)
         }
-
-        lora_query_state_dict = self.lora_query.state_dict()
-
-        frozen_lora_keys = [param.detach().clone() for param in self.frozen_lora_keys]
-        # concat lora key list
-        if len(self.trainable_lora_key) > 0:
-            frozen_param = nn.Parameter(self.trainable_lora_key.clone().detach())
-            frozen_lora_keys.append(frozen_param)
-            temp_param_list = nn.ParameterList([
-                nn.Parameter(p, requires_grad=False) for p in frozen_lora_keys
-            ])
-        
-        lora_key_state_dict = temp_param_list.state_dict()
-
-        combined_state_dict = {}
-        # 添加 base_model 的 LoRA 权重
         for k, v in lora_state_dict.items():
             combined_state_dict[f'base_model.{k}'] = v
 
         # 添加 lora_query 的权重
-        for k, v in lora_query_state_dict.items():
-            combined_state_dict[f'lora_query.{k}'] = v
+        if self.lora_query is not None:
+            lora_query_state_dict = self.lora_query.state_dict()
+            for k, v in lora_query_state_dict.items():
+                combined_state_dict[f'lora_query.{k}'] = v
 
         # 添加 frozen_lora_keys 的权重
-        for k, v in lora_key_state_dict.items():
-            combined_state_dict[f'frozen_lora_keys.key_{k}'] = v
+        if self.frozen_lora_keys is not None and self.trainable_lora_key is not None:
+            frozen_lora_keys = [param.detach().clone() for param in self.frozen_lora_keys]
+            # concat lora key list
+            if len(self.trainable_lora_key) > 0:
+                frozen_param = nn.Parameter(self.trainable_lora_key.clone().detach())
+                frozen_lora_keys.append(frozen_param)
+                temp_param_list = nn.ParameterList([
+                    nn.Parameter(p, requires_grad=False) for p in frozen_lora_keys
+                ])
+            lora_key_state_dict = temp_param_list.state_dict()
+            for k, v in lora_key_state_dict.items():
+                combined_state_dict[f'frozen_lora_keys.key_{k}'] = v
 
         torch.save(combined_state_dict, path)
 
@@ -185,34 +196,36 @@ class ContinualEventExtractionModel(nn.Module):
         self.base_model.load_state_dict(base_model_lora_state, strict=False)
 
         # 恢复 lora_query 层
-        lora_query_state = {k.replace('lora_query.', ''): v for k, v in combined_state_dict.items() if k.startswith('lora_query.')}
-        self.lora_query.load_state_dict(lora_query_state, strict=False)
+        if self.lora_query is not None:
+            lora_query_state = {k.replace('lora_query.', ''): v for k, v in combined_state_dict.items() if k.startswith('lora_query.')}
+            self.lora_query.load_state_dict(lora_query_state, strict=False)
 
         # 恢复 frozen_lora_keys
-        self.frozen_lora_keys = nn.ParameterList()
-        self.trainable_lora_key = nn.Parameter(torch.empty(0, self.model_dim))
-        idx = 0
-        while True:
-            key = f'frozen_lora_keys.key_{idx}'
-            if key in combined_state_dict:
-                param = nn.Parameter(combined_state_dict[key])
-                param.requires_grad = False
-                self.frozen_lora_keys.append(param)
-                idx += 1
-            else:
-                break
+        if self.frozen_lora_keys is not None and self.trainable_lora_key is not None:
+            self.frozen_lora_keys = nn.ParameterList()
+            self.trainable_lora_key = nn.Parameter(torch.empty(0, self.model_dim))
+            idx = 0
+            while True:
+                key = f'frozen_lora_keys.key_{idx}'
+                if key in combined_state_dict:
+                    param = nn.Parameter(combined_state_dict[key])
+                    param.requires_grad = False
+                    self.frozen_lora_keys.append(param)
+                    idx += 1
+                else:
+                    break
 
     def generate(self, text_ids, input_ids, attention_mask):
-         # get lora attention
-        lora_attn_weights = self.get_lora_attention(text_ids)
-
+        # get lora attention
+        lora_attn_weights = self.get_lora_attention(text_ids) if not self.disable_shared_attn else None
+        # lora_attn_weights = torch.ones((len(text_ids), self.n_cur_tasks, 1), dtype=torch.bfloat16, device=text_ids.device)
+        
         outputs = self.base_model.generate(
             inputs=input_ids,
             attention_mask=attention_mask,
             lora_attn_weights=lora_attn_weights,
             max_new_tokens=256,
-            top_p=0.9,
-            pad_token_id=self.tokenizer.eos_token_id
+            pad_token_id=self.tokenizer.pad_token_id
         )
 
         full_text = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)

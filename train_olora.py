@@ -3,42 +3,22 @@ import torch.optim as optim
 import argparse
 import os
 import json
-from utils import set_seeds, get_logger, distribution_state_manager, compute_sample_losses
+from utils import set_seeds, get_logger, distribution_state_manager
 from data import get_dataloader, get_event_types, split_tasks_by_event_types
 from tqdm import tqdm
 from model import ContinualEventExtractionModel
 from accelerate import Accelerator
-from modules.buffer import HardSampleBuffer
-from modules.grad import AttnWeightGrad
-from visualize import visualize_head_importance
 
 
-def train_single_task(args, model, train_dataloader, dev_dataloaders, buffer, accelerator, logger, task_id):
+def train_single_task(args, model, train_dataloader, dev_dataloaders, accelerator, logger, task_id):
     optimizer = optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr)
-
     model, optimizer, train_dataloader = accelerator.prepare(model, optimizer, train_dataloader)
     model_interface = distribution_state_manager(model)
 
     total_loss_history = {
         'train_loss': [],
-        'task_losses': [],
-        'replay_losses': [],
-        'distill_losses': [],
         'dev_loss': [],
     }
-
-    if args.use_distill and task_id > 1:
-        hard_sample_loader = buffer.collect(
-            model_interface.base_model.device, 
-            args.batch_size
-        )
-        # Computing head_importance based on previous hard samples
-        analyzer = AttnWeightGrad(model)
-        head_importance = analyzer.compute_head_importance(hard_sample_loader)
-        analyzer.force_cleanup()
-        del analyzer
-
-        # visualize_head_importance(head_importance, task_id - 1)
 
     torch.cuda.empty_cache()
     accelerator.wait_for_everyone()
@@ -50,7 +30,6 @@ def train_single_task(args, model, train_dataloader, dev_dataloaders, buffer, ac
 
         model.train()
         train_loss = 0.0
-        task_losses, replay_losses, distill_losses = 0.0, 0.0, 0.0
 
         for batch in tqdm(train_dataloader):
             with accelerator.accumulate(model):
@@ -60,56 +39,12 @@ def train_single_task(args, model, train_dataloader, dev_dataloaders, buffer, ac
                 outputs = model(**batch)
                 accelerator.backward(outputs.loss)
 
-                # Knowledge Distillation
-                loss, replay_loss, distill_loss = 0.0, 0.0, 0.0
-                if args.use_distill :
-                    # Record current loss distribution
-                    sample_losses = compute_sample_losses(outputs.logits, batch['labels'])
-                    buffer.add(batch, sample_losses)
-
-                    if task_id > 1:
-                        try:
-                            hard_samples = next(iter(hard_sample_loader))
-                        except StopIteration:
-                            # 重新初始化DataLoader
-                            hard_sample_loader = buffer.collect(
-                                device=model_interface.base_model.device,
-                                batch_size=args.batch_size
-                            )
-                            hard_samples = next(iter(hard_sample_loader))
-
-                        # Tearch model attention weights (Old task)
-                        with torch.no_grad():
-                            teacher_outputs = model(**hard_samples, n_module_to_use=task_id - 1)
-                        # Student model attention weights (New task)
-                        student_outputs = model(**hard_samples)
-
-                        # Calculate distillation loss on attention 
-                        distill_loss = model_interface.compute_distill_loss(
-                            head_importance,
-                            student_outputs.attentions,
-                            teacher_outputs.attentions
-                        )
-                        replay_loss = student_outputs.loss
-                        loss = args.replay_lambda * replay_loss + args.distill_lambda * distill_loss
-                        accelerator.backward(loss)
-    
                 optimizer.step()
 
-                total_loss = outputs.loss + loss
-                train_loss += total_loss.item()
-                task_losses += outputs.loss.item()
-                replay_losses += replay_loss.item() if replay_loss != 0.0 else 0.0
-                distill_losses += distill_loss.item() if distill_loss != 0.0 else 0.0
+                train_loss += outputs.loss.item()
 
         train_loss /= len(train_dataloader)
-        task_losses /= len(train_dataloader)
-        replay_losses /= len(train_dataloader)
-        distill_losses /= len(train_dataloader)
         total_loss_history['train_loss'].append(train_loss)
-        total_loss_history['task_losses'].append(task_losses)
-        total_loss_history['replay_losses'].append(replay_losses)
-        total_loss_history['distill_losses'].append(distill_losses)
 
         # evaluation
         with torch.no_grad():
@@ -131,19 +66,11 @@ def train_single_task(args, model, train_dataloader, dev_dataloaders, buffer, ac
         best_loss_epoch = total_loss_history['dev_loss'].index(best_loss) + 1
         if accelerator.is_main_process:
             logger.info(f"==== Total Train Loss for Epoch {epoch}: {train_loss} ====")
-            logger.info(f"==== Total Task Loss for Epoch {epoch}: {task_losses} ====")
-            logger.info(f"==== Total Replay Loss for Epoch {epoch}: {replay_losses} ====")
-            logger.info(f"==== Total Distill Loss for Epoch {epoch}: {distill_losses} ====")
             logger.info(f"==== Total Dev Loss for Epoch {epoch}: {total_dev_loss} ====")
             logger.info(f"==== Best Dev Loss: {best_loss} at Epoch {best_loss_epoch} ====")
 
         # save best epoch
         if epoch == best_loss_epoch:
-            # Update hard sample buffer based on current loss distribution
-            if args.use_distill:
-                buffer.update(task_id, accelerator)
-                accelerator.print(f"==== Select {len(buffer.buffer.get(task_id, []))} hard samples ====")
-
             if accelerator.is_main_process:
                 ckpt_path = os.path.join(args.output_path, f"ckpt_best_loss_task_{task_id}.pth")
                 model_interface.save(ckpt_path)
@@ -156,15 +83,13 @@ def train_single_task(args, model, train_dataloader, dev_dataloaders, buffer, ac
         ckpt_path = os.path.join(args.output_path, f"ckpt_final_task_{task_id}.pth")
         model_interface.save(ckpt_path)
         logger.info(f"==== Save final ckpt to {ckpt_path} ====")
-    
-    accelerator.wait_for_everyone()
 
-    return buffer if args.use_distill else None
+    accelerator.wait_for_everyone()
 
 
 def train(args, model, accelerator, logger):
     # Get all event types
-    event_types = get_event_types(args)
+    event_types = get_event_types(args, force_rebuild=True)
     event_type_groups = split_tasks_by_event_types(args, event_types=event_types)
     if accelerator.is_main_process:
         with open(os.path.join(args.output_path, 'event_type_groups.json'), 'w') as f:
@@ -173,21 +98,11 @@ def train(args, model, accelerator, logger):
     train_dataloaders = get_dataloader(args, event_type_groups, tokenizer=model.tokenizer, phase='trigger', split='train')
     dev_dataloaders = get_dataloader(args, event_type_groups, tokenizer=model.tokenizer, phase='trigger', split='dev')
 
-    # Hard sample replay buffer
-    if args.use_distill:
-        buffer = HardSampleBuffer(
-            tokenizer=model.tokenizer,
-            max_buffer_size=args.max_buffer_size // torch.cuda.device_count(),
-            ratio=args.ratio,
-        )
-    else:
-        buffer = None
-
-    for task_id, train_dataloader in enumerate(train_dataloaders):
+    for task_id, (train_dataloader, dev_dataloader) in enumerate(zip(train_dataloaders, dev_dataloaders)):
         if accelerator.is_main_process:
             logger.info(f"==== Training Task {task_id + 1} ====")
             logger.info(f"==== Initialize model for task {task_id + 1} ====")
-
+        
         # Load best checkpoint from last task before training the new one
         if task_id > 0:
             previous_ckpt_path = os.path.join(args.output_path, f"ckpt_best_loss_task_{task_id}.pth")
@@ -196,15 +111,13 @@ def train(args, model, accelerator, logger):
                 logger.info(f"Loaded best checkpoint from task {task_id} at {previous_ckpt_path}")
 
         model.reset_for_new_task()
-        buffer = train_single_task(args, model, train_dataloader, dev_dataloaders[:task_id + 1], buffer, accelerator, logger, task_id + 1)
-        
-        if args.use_distill:
-            print(f"==== Select {len(buffer.buffer.get(task_id + 1, []))} hard samples for task {task_id + 1} ====")
+        train_single_task(args, model, train_dataloader, dev_dataloaders[:task_id + 1], accelerator, logger, task_id + 1)
 
         if accelerator.is_main_process:
             logger.info(f"==== Task {task_id + 1} Training Done ====")
 
         torch.cuda.empty_cache()
+        
 
 
 def get_args():
@@ -250,21 +163,6 @@ def get_args():
         help='stratrgy for spliting dataset '
     )
 
-    # buffer settings
-    parser.add_argument(
-        '--max_buffer_size', type=int, default=64, 
-        help=''
-    )
-    parser.add_argument(
-        '--ratio', type=float, default=0.01, 
-        help=''
-    )
-    parser.add_argument(
-        '--mode', type=str, default='distribution',
-        choices=['topk', 'distribution'],
-        help=''
-    )
-
     # training settings
     parser.add_argument(
         '--seed', type=int, default=42, 
@@ -289,18 +187,6 @@ def get_args():
     parser.add_argument(
         '--disable_shared_attn', action='store_true', default=False,
         help='是否启用共享注意力'
-    )
-    parser.add_argument(
-        '--distill_lambda', type=float, default=1.0,
-        help='知识蒸馏损失的权重'
-    )
-    parser.add_argument(
-        '--replay_lambda', type=float, default=1.0,
-        help='知识蒸馏损失的权重'
-    )
-    parser.add_argument(
-        '--use_distill', action='store_true', default=False,
-        help='是否启用知识蒸馏'
     )
 
     # save settings

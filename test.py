@@ -4,55 +4,65 @@ import argparse
 import os
 from argparse import Namespace
 from accelerate import Accelerator
-from utils import set_seeds, compare_json
+from utils import set_seeds, compute_event_f1, compute_acc
 from model import ContinualEventExtractionModel
 from data import get_dataloader
 from tqdm import tqdm
-import sys
 
 
-def inference(args, model, accelerator):
-    with open(os.path.join(args.checkpoint_path, 'event_type_groups.json'), 'r') as f:
-        event_type_groups = json.load(f)
-    test_dataloaders = get_dataloader(args, event_type_groups, tokenizer=model.tokenizer, phase='trigger', split='test')
-
+def inference(args, model, accelerator, test_dataloaders):
+    results = []
     for task_id, test_dataloader in enumerate(test_dataloaders):
         model, test_dataloader = accelerator.prepare(model, test_dataloader)
-
-        acc = 0.0
-        n_samples = 0
-        n_invalid = 0
 
         with torch.no_grad():
             model.eval()
             for batch in tqdm(test_dataloader):
                 text_ids, input_ids, attention_mask, labels = batch['text_ids'], batch['input_ids'], batch['attention_mask'], batch['labels']
 
-                # get input_ids without answer
-                mask_lens = (labels == -100).sum(dim=1)
-                input_ids_without_labels = input_ids[:, :mask_lens]
-                attention_mask = attention_mask[:, :mask_lens]
-
                 with accelerator.autocast():
-                    outputs = model.generate(text_ids, input_ids_without_labels, attention_mask)
+                    outputs = model.generate(text_ids, input_ids, attention_mask)
 
-                labels = [sample[sample != -100.0] for sample in labels]
-                labels = model.tokenizer.batch_decode(labels, skip_special_tokens=True)
+                for i in range(len(outputs)):
+                    results.append({
+                        'task_id': task_id + 1,
+                        'label': labels[i],
+                        'prediction': outputs[i]
+                    })
 
-                results = compare_json(outputs, labels)
-
-                for result in results:
-                    if result != -1:
-                        acc += result
-                    else:
-                        n_invalid += 1
-
-                n_samples += len(text_ids)
-        
-        acc /= n_samples
-        print(f'Accuracy: {acc}')
-        print(f'Invalid: {n_invalid}')
+    with open(os.path.join(args.checkpoint_path, 'predictions.jsonl'), 'w', encoding='utf-8') as f:
+        for result in results:
+            f.write(json.dumps(result, ensure_ascii=False) + '\n')
     
+
+def evaluate(args):
+    total_results = {}
+    with open(os.path.join(args.checkpoint_path, 'predictions.jsonl'), 'r', encoding='utf-8') as f:
+        for line in f:
+            item = json.loads(line)
+            task_key = f"task_{item['task_id']}"
+            if task_key not in total_results:
+                total_results[task_key] = []
+
+            try:
+                pred = json.loads(item['prediction'])
+            except json.JSONDecodeError:
+                pred = json.loads('[]')
+
+            total_results[task_key].append((
+                pred, 
+                json.loads(item['label'])
+            ))
+    
+    task_acc = 0.0
+    for task_id, results in total_results.items():
+        task_f1_score = compute_event_f1(results)
+        print(f"Task {task_id} F1: {task_f1_score['f1']:.4f}")
+
+        task_acc += compute_acc(results)
+    
+    print(f"Acc: {task_acc / len(total_results):.4f}")
+        
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -89,14 +99,21 @@ def main():
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
+        disable_shared_attn=args.disable_shared_attn,
     )
     for i in range(args.n_tasks):
         model.reset_for_new_task()
+    # model.reset_for_new_task()
     model.load(os.path.join(args.checkpoint_path, f'ckpt_best_loss_task_{args.n_tasks}.pth'))
 
     torch.cuda.empty_cache()
 
-    inference(args, model, accelerator)
+    with open(os.path.join(args.checkpoint_path, 'event_type_groups.json'), 'r') as f:
+        event_type_groups = json.load(f)
+    test_dataloaders = get_dataloader(args, event_type_groups, tokenizer=model.tokenizer, phase='trigger', split='test')
+
+    inference(args, model, accelerator, test_dataloaders)
+    evaluate(args)
 
 
 if __name__ == "__main__":

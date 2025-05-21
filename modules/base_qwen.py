@@ -46,22 +46,29 @@ class Qwen2AttentionWithLora(Qwen2Attention):
         )
 
     def get_merged_lora_states(self, hidden_states, lora_attn_weights, target='q', n_module_to_use=None):
-        bsz, n_task, _ = lora_attn_weights.size()
-        if n_module_to_use is None:
-            n_module_to_use = n_task
-        
-        lora_attn_weights = lora_attn_weights[:, :n_module_to_use]
+        if lora_attn_weights is not None:
+            bsz, n_task, _ = lora_attn_weights.size()
+            if n_module_to_use is None:
+                n_module_to_use = n_task
+            
+            lora_attn_weights = lora_attn_weights[:, :n_module_to_use]
 
-        if target == 'q':
-            lora_states = torch.cat([lora(hidden_states).unsqueeze(0) for lora in self.lora_q_weights[:n_module_to_use]], dim=0)
-            lora_states = lora_states.transpose(0, 1).reshape(bsz, -1, hidden_states.shape[1] * self.num_heads * self.head_dim)
-            merged_lora_states = torch.matmul(lora_attn_weights.transpose(1, 2), lora_states).squeeze()
-            merged_lora_states = merged_lora_states.reshape(bsz, -1, self.num_heads * self.head_dim)
-        elif target == 'v':
-            lora_states = torch.cat([lora(hidden_states).unsqueeze(0) for lora in self.lora_v_weights[:n_module_to_use]], dim=0)
-            lora_states = lora_states.transpose(0, 1).reshape(bsz, -1, hidden_states.shape[1] * self.num_key_value_heads * self.head_dim)
-            merged_lora_states = torch.matmul(lora_attn_weights.transpose(1, 2), lora_states).squeeze()
-            merged_lora_states = merged_lora_states.reshape(bsz, -1, self.num_key_value_heads * self.head_dim)
+            if target == 'q':
+                lora_states = torch.cat([lora(hidden_states).unsqueeze(0) for lora in self.lora_q_weights[:n_module_to_use]], dim=0)
+                lora_states = lora_states.transpose(0, 1).reshape(bsz, -1, hidden_states.shape[1] * self.num_heads * self.head_dim)
+                merged_lora_states = torch.matmul(lora_attn_weights.transpose(1, 2), lora_states).squeeze()
+                merged_lora_states = merged_lora_states.reshape(bsz, -1, self.num_heads * self.head_dim)
+            elif target == 'v':
+                lora_states = torch.cat([lora(hidden_states).unsqueeze(0) for lora in self.lora_v_weights[:n_module_to_use]], dim=0)
+                lora_states = lora_states.transpose(0, 1).reshape(bsz, -1, hidden_states.shape[1] * self.num_key_value_heads * self.head_dim)
+                merged_lora_states = torch.matmul(lora_attn_weights.transpose(1, 2), lora_states).squeeze()
+                merged_lora_states = merged_lora_states.reshape(bsz, -1, self.num_key_value_heads * self.head_dim)
+        else:
+            bsz = hidden_states.shape[0]
+            if target == 'q':
+                merged_lora_states = self.lora_q_weights[0](hidden_states).reshape(bsz, -1, self.num_heads * self.head_dim)
+            elif target == 'v':
+                merged_lora_states = self.lora_v_weights[0](hidden_states).reshape(bsz, -1, self.num_key_value_heads * self.head_dim)
 
         return merged_lora_states
 
@@ -69,7 +76,7 @@ class Qwen2AttentionWithLora(Qwen2Attention):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        lora_attn_weights: torch.Tensor,
+        lora_attn_weights: torch.Tensor = None,
         n_module_to_use: Optional[int] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
@@ -160,7 +167,7 @@ class Qwen2FlashAttention2WithLora(Qwen2AttentionWithLora):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        lora_attn_weights: torch.Tensor,
+        lora_attn_weights: torch.Tensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Cache] = None,

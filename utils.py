@@ -96,26 +96,46 @@ def clean_text(texts):
     return cleaned_text
 
 
-def compare_json(outputs, labels):
-    results = []
-    for output, label in zip(outputs, labels):
-        try:
-            obj1 = json.loads(output)
-            obj2 = json.loads(label)
-            results.append(1 if obj1 == obj2 else 0) 
-        except json.JSONDecodeError:
-            print("Invalid json format!")
-            results.append(-1)
+def get_mask_len(prompt, tokenizer):
+    token_id = tokenizer.encode(":", add_special_tokens=False)[0]
 
-    return results
+    reverse_index = torch.where(prompt.flip(0) == token_id)[0]
+
+    if len(reverse_index) > 0:
+        idx = prompt.size(0) - 1 - reverse_index[0].item()
+        result = prompt[:idx + 1]
+
+    return len(result)
+
+
+def compute_acc(results):
+    acc = 0.0
+
+    for (pred_events, gold_events) in results:
+        if pred_events == json.loads('[]'):
+            pred_events = json.loads('[{"trigger_word": "None", "event_type": "None", "span": "None"}]')
+        try:
+            pred_set = set((e['event_type'], e['trigger_word'], str(e['span'])) for e in pred_events)
+        except:
+            pred_set = set()
+        gold_set = set((e['event_type'], e['trigger_word'], str(e['span'])) for e in gold_events)
+
+        acc += int(pred_set == gold_set)
+
+    return acc / len(results) * 100
+
     
-def compute_event_f1(predictions, ground_truths):
+def compute_event_f1(results):
     TP, FP, FN = 0, 0, 0
 
-    for pred_events, gold_events in zip(predictions, ground_truths):
-        # Convert to set of tuples
-        pred_set = set((e['event_type'], e['trigger']) for e in pred_events)
-        gold_set = set((e['event_type'], e['trigger']) for e in gold_events)
+    for (pred_events, gold_events) in results:
+        if pred_events == json.loads('[]'):
+            pred_events = json.loads('[{"trigger_word": "None", "event_type": "None", "span": "None"}]')
+        try:
+            pred_set = set((e['event_type'], e['trigger_word'], str(e['span'])) for e in pred_events)
+        except:
+            pred_set = set()
+        gold_set = set((e['event_type'], e['trigger_word'], str(e['span'])) for e in gold_events)
 
         TP += len(pred_set & gold_set)
         FP += len(pred_set - gold_set)
@@ -126,7 +146,7 @@ def compute_event_f1(predictions, ground_truths):
     f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
 
     return {
-        "precision": precision,
-        "recall": recall,
-        "f1": f1
+        "precision": precision * 100,
+        "recall": recall * 100,
+        "f1": f1 * 100
     }
