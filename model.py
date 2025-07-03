@@ -7,6 +7,7 @@ from transformers import AutoTokenizer
 import math
 from modules.lora import LoRAConfig
 from utils import clean_text
+import sys
 
 
 class ContinualEventExtractionModel(nn.Module):

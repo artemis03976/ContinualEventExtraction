@@ -70,12 +70,8 @@ def compute_sample_losses(logits, labels):
 
 def get_grad_norm(attn_grad):
     # attn_grad: (batch_size, num_heads, seq_len, seq_len)
-    # 先按 batch 维度求平均，然后对每个 head 计算 L2 范数
-    grad_mean = attn_grad.mean(dim=0)  # (num_heads, seq_len, seq_len)
-    # 展开最后两个维度，计算每个 head 的 L2 范数
-    num_heads = grad_mean.size(0)
-    l2_norms = grad_mean.view(num_heads, -1).norm(p=2, dim=1)  # (num_heads,)
-    return l2_norms
+    frobenius_norms = (attn_grad ** 2).sum(dim=(0, 2, 3)).sqrt()  # (num_heads,)
+    return frobenius_norms
 
 
 def clean_text(texts):

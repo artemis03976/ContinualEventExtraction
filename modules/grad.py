@@ -62,6 +62,8 @@ class AttnWeightGrad(object):
         
         for i in range(num_layers):
             accumulators[i] /= len(sample_dataloader)
+            # Normalize by sum of all heads
+            accumulators[i] /= accumulators[i].sum() 
             head_importance[f"layer_{i}"] = accumulators[i]
 
         return head_importance

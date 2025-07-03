@@ -14,7 +14,14 @@ from visualize import visualize_head_importance
 
 
 def train_single_task(args, model, train_dataloader, dev_dataloaders, buffer, accelerator, logger, task_id):
-    optimizer = optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr)
+    optimizer = optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr, weight_decay=0.001)
+    if args.use_distill and task_id > 1:
+        target_module_names = {'lora_query', 'lora_key'}
+        target_params = []
+        for name, module in model.named_modules():
+            if name in target_module_names:
+                target_params.extend(list(module.parameters()))
+        optimizer_distill = optim.AdamW(target_params, lr=args.lr, weight_decay=0.001)
 
     model, optimizer, train_dataloader = accelerator.prepare(model, optimizer, train_dataloader)
     model_interface = distribution_state_manager(model)
@@ -59,15 +66,17 @@ def train_single_task(args, model, train_dataloader, dev_dataloaders, buffer, ac
                 # new task sample
                 outputs = model(**batch)
                 accelerator.backward(outputs.loss)
+                optimizer.step()
 
                 # Knowledge Distillation
                 loss, replay_loss, distill_loss = 0.0, 0.0, 0.0
-                if args.use_distill :
+                if args.use_distill:
                     # Record current loss distribution
                     sample_losses = compute_sample_losses(outputs.logits, batch['labels'])
                     buffer.add(batch, sample_losses)
 
                     if task_id > 1:
+                        optimizer_distill.zero_grad()
                         try:
                             hard_samples = next(iter(hard_sample_loader))
                         except StopIteration:
@@ -93,8 +102,7 @@ def train_single_task(args, model, train_dataloader, dev_dataloaders, buffer, ac
                         replay_loss = student_outputs.loss
                         loss = args.replay_lambda * replay_loss + args.distill_lambda * distill_loss
                         accelerator.backward(loss)
-    
-                optimizer.step()
+                        optimizer_distill.step()
 
                 total_loss = outputs.loss + loss
                 train_loss += total_loss.item()

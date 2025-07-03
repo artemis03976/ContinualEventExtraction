@@ -4,7 +4,7 @@ import argparse
 import os
 from argparse import Namespace
 from accelerate import Accelerator
-from utils import set_seeds, compute_event_f1
+from utils import set_seeds, compute_event_f1, compute_acc
 from model import ContinualEventExtractionModel
 from data import get_dataloader
 from tqdm import tqdm
@@ -35,9 +35,15 @@ class PerformanceLogger:
                     pred, 
                     json.loads(item['label'])
                 ))
+            
+        task_acc = 0.0
         for eval_task_id, results in total_results.items():
             task_f1_score = compute_event_f1(results)['f1']
+            print(f"Task {task_id} F1: {task_f1_score:.4f}")
+            task_acc += compute_acc(results)
             self.R[task_id][int(eval_task_id)] = task_f1_score
+        
+        print(f"Acc: {task_acc / len(total_results):.4f}")
                 
     def calculate_bwt(self):
         """计算反向迁移分数"""
